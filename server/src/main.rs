@@ -3,14 +3,14 @@ use bytes::{Buf, BufMut, BytesMut};
 use log::{debug, error, info, warn};
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::os::unix::io::AsRawFd;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::RwLock;
 use tokio::time::interval;
-use tun::AsyncDevice;
-use tun::Device;
+use tun::platform::Device;
 
 const BUFFER_SIZE: usize = 65536;
 const SESSION_TIMEOUT: Duration = Duration::from_secs(120);
@@ -42,8 +42,9 @@ async fn main() -> Result<()> {
 
     // Create TUN device for routing packets to internet
     let tun_device = create_tun_device()?;
-    let tun_device = Arc::new(tun_device);
-    info!("✅ TUN device created and configured");
+    let tun_fd = tun_device.as_raw_fd();
+    let tun_device = Arc::new(tokio::io::unix::AsyncFd::new(tun_device)?);
+    info!("✅ TUN device created and configured (fd: {})", tun_fd);
 
     let sessions: Sessions = Arc::new(RwLock::new(HashMap::new()));
 
@@ -86,7 +87,7 @@ async fn main() -> Result<()> {
 }
 
 /// Create and configure TUN device
-fn create_tun_device() -> Result<AsyncDevice> {
+fn create_tun_device() -> Result<Device> {
     let mut config = tun::Configuration::default();
     config
         .name("netual0")
@@ -96,10 +97,10 @@ fn create_tun_device() -> Result<AsyncDevice> {
 
     #[cfg(target_os = "linux")]
     config.platform(|config| {
-        config.packet_information(true);
+        config.packet_information(false);
     });
 
-    let dev = tun::create_as_async(&config)?;
+    let dev = tun::create(&config)?;
     
     info!("🌐 TUN device 'netual0' created with IP 10.0.0.1/24");
     info!("   Run on Linux: sudo iptables -t nat -A POSTROUTING -s 10.0.0.0/24 -j MASQUERADE");
@@ -157,7 +158,7 @@ async fn handle_control_connection(
 async fn handle_client_to_tun(
     socket: Arc<UdpSocket>,
     sessions: Sessions,
-    tun_device: Arc<AsyncDevice>,
+    tun_device: Arc<tokio::io::unix::AsyncFd<Device>>,
 ) -> Result<()> {
     let mut buf = vec![0u8; BUFFER_SIZE];
 
@@ -194,7 +195,7 @@ async fn process_client_packet(
     data: Vec<u8>,
     src_addr: SocketAddr,
     sessions: Sessions,
-    tun_device: Arc<AsyncDevice>,
+    tun_device: Arc<tokio::io::unix::AsyncFd<Device>>,
 ) -> Result<()> {
     if data.len() < PACKET_HEADER_SIZE {
         return Ok(()); // Too small
@@ -257,14 +258,17 @@ async fn process_client_packet(
     if payload.len() > 20 {
         drop(sessions); // Release lock before async write
         
-        match tun_device.send(payload).await {
-            Ok(_) => {
-                debug!("✅ Wrote packet seq {} to TUN device ({} bytes)", packet_seq, payload.len());
-            }
-            Err(e) => {
+        let tun_clone = tun_device.clone();
+        let payload_vec = payload.to_vec();
+        tokio::task::spawn_blocking(move || {
+            use std::io::Write;
+            let mut guard = tun_clone.get_ref();
+            if let Err(e) = guard.write_all(&payload_vec) {
                 debug!("Failed to write to TUN: {}", e);
+            } else {
+                debug!("✅ Wrote packet seq {} to TUN device ({} bytes)", packet_seq, payload_vec.len());
             }
-        }
+        });
     }
 
     Ok(())
@@ -272,16 +276,23 @@ async fn process_client_packet(
 
 /// TUN -> Client handler: Reads from TUN and sends back to clients
 async fn handle_tun_to_client(
-    tun_device: Arc<AsyncDevice>,
+    tun_device: Arc<tokio::io::unix::AsyncFd<Device>>,
     tunnel_socket: Arc<UdpSocket>,
     sessions: Sessions,
 ) {
-    let mut buf = vec![0u8; BUFFER_SIZE];
     let mut response_seq_map: HashMap<u32, u32> = HashMap::new();
     
     loop {
-        match tun_device.recv(&mut buf).await {
-            Ok(n) => {
+        let mut buf = vec![0u8; BUFFER_SIZE];
+        let tun_clone = tun_device.clone();
+        
+        let n = match tokio::task::spawn_blocking(move || {
+            use std::io::Read;
+            let mut guard = tun_clone.get_ref();
+            guard.read(&mut buf).map(|n| (n, buf))
+        }).await {
+            Ok(Ok((n, buf))) => {
+                if n > 0 {
                 if n < 20 {
                     continue; // Too small for IP packet
                 }
@@ -327,12 +338,22 @@ async fn handle_tun_to_client(
                         }
                     }
                 }
+                buf
+                } else {
+                    continue;
+                }
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 error!("TUN read error: {}", e);
                 tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
             }
-        }
+            Err(e) => {
+                error!("TUN task error: {}", e);
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
+            }
+        };
     }
 }
 
