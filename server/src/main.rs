@@ -3,7 +3,7 @@ use bytes::{Buf, BufMut, BytesMut};
 use log::{debug, error, info, warn};
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::os::unix::io::AsRawFd;
+use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -260,14 +260,19 @@ async fn process_client_packet(
         
         let tun_clone = tun_device.clone();
         let payload_vec = payload.to_vec();
+        let seq = packet_seq; // Capture for closure
         tokio::task::spawn_blocking(move || {
             use std::io::Write;
-            let mut guard = tun_clone.get_ref();
-            if let Err(e) = guard.write_all(&payload_vec) {
+            use std::os::unix::io::AsRawFd;
+            let fd = tun_clone.as_raw_fd();
+            // Reconstruct device from raw fd for mutable access
+            let mut device = unsafe { Device::from_raw_fd(fd) };
+            if let Err(e) = device.write_all(&payload_vec) {
                 debug!("Failed to write to TUN: {}", e);
             } else {
-                debug!("✅ Wrote packet seq {} to TUN device ({} bytes)", packet_seq, payload_vec.len());
+                debug!("✅ Wrote packet seq {} to TUN device ({} bytes)", seq, payload_vec.len());
             }
+            std::mem::forget(device); // Don't close the fd
         });
     }
 
@@ -283,64 +288,24 @@ async fn handle_tun_to_client(
     let mut response_seq_map: HashMap<u32, u32> = HashMap::new();
     
     loop {
-        let mut buf = vec![0u8; BUFFER_SIZE];
         let tun_clone = tun_device.clone();
         
-        let n = match tokio::task::spawn_blocking(move || {
+        let (n, buf) = match tokio::task::spawn_blocking(move || {
             use std::io::Read;
-            let mut guard = tun_clone.get_ref();
-            guard.read(&mut buf).map(|n| (n, buf))
+            use std::os::unix::io::AsRawFd;
+            let mut buf = vec![0u8; BUFFER_SIZE];
+            let fd = tun_clone.as_raw_fd();
+            // Reconstruct device from raw fd for mutable access
+            let mut device = unsafe { Device::from_raw_fd(fd) };
+            let result = device.read(&mut buf).map(|n| (n, buf));
+            std::mem::forget(device); // Don't close the fd
+            result
         }).await {
             Ok(Ok((n, buf))) => {
-                if n > 0 {
-                if n < 20 {
+                if n > 20 {
+                    (n, buf)
+                } else {
                     continue; // Too small for IP packet
-                }
-                
-                let ip_packet = &buf[..n];
-                
-                // Extract destination IP from IP header (bytes 16-19 for IPv4)
-                // Simplified: we need to identify which session this response belongs to
-                // For now, use source IP (bytes 12-15) to match to client's VPN IP
-                
-                let dest_ip = if n >= 20 && (ip_packet[0] >> 4) == 4 {
-                    // IPv4: destination IP is at bytes 16-19
-                    [ip_packet[16], ip_packet[17], ip_packet[18], ip_packet[19]]
-                } else {
-                    continue; // Skip non-IPv4 for now
-                };
-                
-                // Match dest IP 10.0.0.X to session
-                // Client uses 10.0.0.2, so we need to find session by tracking
-                // For simplicity, broadcast to all active sessions (or implement proper routing)
-                
-                let sessions_read = sessions.read().await;
-                
-                for (session_id, session) in sessions_read.iter() {
-                    // Get or init response sequence for this session
-                    let response_seq = response_seq_map.entry(*session_id).or_insert(0);
-                    
-                    // Build packet with header
-                    let mut packet = BytesMut::with_capacity(PACKET_HEADER_SIZE + n);
-                    packet.put_u32(*session_id);
-                    packet.put_u32(*response_seq);
-                    *response_seq = response_seq.wrapping_add(1);
-                    packet.put_slice(ip_packet);
-                    
-                    // Send to ALL active client connections (WiFi + Mobile)
-                    for (client_addr, conn_info) in &session.connections {
-                        if conn_info.last_seen.elapsed().as_secs() < 10 {
-                            if let Err(e) = tunnel_socket.send_to(&packet, client_addr).await {
-                                debug!("Failed to send to {}: {}", client_addr, e);
-                            } else {
-                                debug!("📨 Sent {} bytes to {}", n, client_addr);
-                            }
-                        }
-                    }
-                }
-                buf
-                } else {
-                    continue;
                 }
             }
             Ok(Err(e)) => {
@@ -354,6 +319,45 @@ async fn handle_tun_to_client(
                 continue;
             }
         };
+        
+        let ip_packet = &buf[..n];
+        
+        // Extract destination IP from IP header (bytes 16-19 for IPv4)
+        // Simplified: we need to identify which session this response belongs to
+        // For now, broadcast to all active sessions
+        
+        if n < 20 || (ip_packet[0] >> 4) != 4 {
+            continue; // Skip non-IPv4 or too small
+        }
+        
+        // Destination IP could be used for routing (not implemented yet)
+        let _dest_ip = [ip_packet[16], ip_packet[17], ip_packet[18], ip_packet[19]];
+        
+        // Broadcast to all active sessions (simplified routing)
+        let sessions_read = sessions.read().await;
+        
+        for (session_id, session) in sessions_read.iter() {
+            // Get or init response sequence for this session
+            let response_seq = response_seq_map.entry(*session_id).or_insert(0);
+            
+            // Build packet with header
+            let mut packet = BytesMut::with_capacity(PACKET_HEADER_SIZE + n);
+            packet.put_u32(*session_id);
+            packet.put_u32(*response_seq);
+            *response_seq = response_seq.wrapping_add(1);
+            packet.put_slice(ip_packet);
+            
+            // Send to ALL active client connections (WiFi + Mobile)
+            for (client_addr, conn_info) in &session.connections {
+                if conn_info.last_seen.elapsed().as_secs() < 10 {
+                    if let Err(e) = tunnel_socket.send_to(&packet, client_addr).await {
+                        debug!("Failed to send to {}: {}", client_addr, e);
+                    } else {
+                        debug!("📨 Sent {} bytes to {}", n, client_addr);
+                    }
+                }
+            }
+        }
     }
 }
 
