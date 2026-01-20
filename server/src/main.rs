@@ -9,6 +9,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::RwLock;
 use tokio::time::interval;
+use tun::AsyncDevice;
+use tun::Device;
 
 const BUFFER_SIZE: usize = 65536;
 const SESSION_TIMEOUT: Duration = Duration::from_secs(120);
@@ -19,10 +21,9 @@ const PACKET_HEADER_SIZE: usize = 8; // session_id(4) + packet_seq(4)
 struct ClientSession {
     session_id: u32,
     connections: HashMap<SocketAddr, ConnectionInfo>,
-    packet_buffer: HashMap<u32, Vec<u8>>, // packet_seq -> packet data
+    packet_buffer: HashMap<u32, Vec<u8>>, // packet_seq -> packet data (for dedup)
     next_expected_seq: u32,
     last_activity: Instant,
-    internet_socket: Option<Arc<UdpSocket>>, // For forwarding to internet
 }
 
 #[derive(Debug, Clone)]
@@ -37,7 +38,12 @@ type Sessions = Arc<RwLock<HashMap<u32, ClientSession>>>;
 async fn main() -> Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
-    info!("🚀 Netual Server starting...");
+    info!("🚀 Netual VPN Server starting...");
+
+    // Create TUN device for routing packets to internet
+    let tun_device = create_tun_device()?;
+    let tun_device = Arc::new(tun_device);
+    info!("✅ TUN device created and configured");
 
     let sessions: Sessions = Arc::new(RwLock::new(HashMap::new()));
 
@@ -67,10 +73,39 @@ async fn main() -> Result<()> {
         }
     });
 
-    // Main tunnel packet handler
-    handle_tunnel_packets(tunnel_socket, sessions).await?;
+    // Spawn TUN reader - reads from internet and sends back to clients
+    let tun_reader = tun_device.clone();
+    let tunnel_sock_reader = tunnel_socket.clone();
+    let sessions_reader = sessions.clone();
+    tokio::spawn(handle_tun_to_client(tun_reader, tunnel_sock_reader, sessions_reader));
+
+    // Main tunnel packet handler - reads from clients and writes to TUN
+    handle_client_to_tun(tunnel_socket, sessions, tun_device).await?;
 
     Ok(())
+}
+
+/// Create and configure TUN device
+fn create_tun_device() -> Result<AsyncDevice> {
+    let mut config = tun::Configuration::default();
+    config
+        .name("netual0")
+        .address((10, 0, 0, 1))
+        .netmask((255, 255, 255, 0))
+        .up();
+
+    #[cfg(target_os = "linux")]
+    config.platform(|config| {
+        config.packet_information(true);
+    });
+
+    let dev = tun::create_as_async(&config)?;
+    
+    info!("🌐 TUN device 'netual0' created with IP 10.0.0.1/24");
+    info!("   Run on Linux: sudo iptables -t nat -A POSTROUTING -s 10.0.0.0/24 -j MASQUERADE");
+    info!("   Run on Linux: sudo sysctl -w net.ipv4.ip_forward=1");
+    
+    Ok(dev)
 }
 
 /// Handle control connection for client registration
@@ -104,7 +139,6 @@ async fn handle_control_connection(
                 packet_buffer: HashMap::new(),
                 next_expected_seq: 0,
                 last_activity: Instant::now(),
-                internet_socket: None,
             },
         );
 
@@ -119,8 +153,12 @@ async fn handle_control_connection(
     Ok(())
 }
 
-/// Main packet handler - receives packets from Android client and forwards to internet
-async fn handle_tunnel_packets(socket: Arc<UdpSocket>, sessions: Sessions) -> Result<()> {
+/// Main handler: Client -> TUN (client sends packet, we write to TUN/internet)
+async fn handle_client_to_tun(
+    socket: Arc<UdpSocket>,
+    sessions: Sessions,
+    tun_device: Arc<AsyncDevice>,
+) -> Result<()> {
     let mut buf = vec![0u8; BUFFER_SIZE];
 
     loop {
@@ -128,15 +166,15 @@ async fn handle_tunnel_packets(socket: Arc<UdpSocket>, sessions: Sessions) -> Re
             Ok((n, src_addr)) => {
                 let data = &buf[..n];
                 let sessions_clone = sessions.clone();
-                let socket_clone = socket.clone();
+                let tun_clone = tun_device.clone();
                 let data_owned = data.to_vec();
 
                 tokio::spawn(async move {
-                    if let Err(e) = process_tunnel_packet(
+                    if let Err(e) = process_client_packet(
                         data_owned,
                         src_addr,
                         sessions_clone,
-                        socket_clone,
+                        tun_clone,
                     )
                     .await
                     {
@@ -151,12 +189,12 @@ async fn handle_tunnel_packets(socket: Arc<UdpSocket>, sessions: Sessions) -> Re
     }
 }
 
-/// Process individual tunnel packet
-async fn process_tunnel_packet(
+/// Process packet from client and write to TUN device
+async fn process_client_packet(
     data: Vec<u8>,
     src_addr: SocketAddr,
     sessions: Sessions,
-    tunnel_socket: Arc<UdpSocket>,
+    tun_device: Arc<AsyncDevice>,
 ) -> Result<()> {
     if data.len() < PACKET_HEADER_SIZE {
         return Ok(()); // Too small
@@ -185,7 +223,7 @@ async fn process_tunnel_packet(
 
     let session = session.unwrap();
 
-    // Update connection info
+    // Update connection info (track both WiFi and Mobile)
     session
         .connections
         .entry(src_addr)
@@ -200,7 +238,7 @@ async fn process_tunnel_packet(
 
     session.last_activity = Instant::now();
 
-    // Deduplicate packets (client sends on both WiFi and Mobile)
+    // Deduplicate packets (client sends on BOTH WiFi and Mobile)
     if session.packet_buffer.contains_key(&packet_seq) {
         debug!("🔄 Duplicate packet {} ignored (already processed)", packet_seq);
         return Ok(());
@@ -211,45 +249,20 @@ async fn process_tunnel_packet(
     
     // Keep buffer size manageable
     if session.packet_buffer.len() > 100 {
-        // Remove old packets
         let min_seq = packet_seq.saturating_sub(100);
         session.packet_buffer.retain(|seq, _| *seq > min_seq);
     }
 
-    // Create internet socket if not exists (for forwarding)
-    if session.internet_socket.is_none() {
-        let internet_sock = UdpSocket::bind("0.0.0.0:0").await?;
-        session.internet_socket = Some(Arc::new(internet_sock));
+    // Write IP packet to TUN device (forwards to internet via Linux routing)
+    if payload.len() > 20 {
+        drop(sessions); // Release lock before async write
         
-        // Spawn response handler for ALL registered client connections
-        let internet_sock = session.internet_socket.as_ref().unwrap().clone();
-        let tunnel_sock = tunnel_socket.clone();
-        let sess_id = session_id;
-        let sessions_clone = sessions.clone();
-        
-        tokio::spawn(handle_internet_responses(
-            internet_sock,
-            tunnel_sock,
-            sess_id,
-            sessions_clone,
-        ));
-        
-        info!("🌐 Created internet socket for session {}", session_id);
-    }
-
-    // Forward packet to internet immediately (accept out-of-order)
-    if let Some(ref internet_sock) = session.internet_socket {
-        if payload.len() > 20 {
-            match forward_packet_to_internet(internet_sock, payload).await {
-                Ok(_) => {
-                    debug!("✅ Forwarded packet seq {} to internet", packet_seq);
-                    if packet_seq >= session.next_expected_seq {
-                        session.next_expected_seq = packet_seq + 1;
-                    }
-                }
-                Err(e) => {
-                    debug!("Failed to forward packet: {}", e);
-                }
+        match tun_device.send(payload).await {
+            Ok(_) => {
+                debug!("✅ Wrote packet seq {} to TUN device ({} bytes)", packet_seq, payload.len());
+            }
+            Err(e) => {
+                debug!("Failed to write to TUN: {}", e);
             }
         }
     }
@@ -257,58 +270,67 @@ async fn process_tunnel_packet(
     Ok(())
 }
 
-/// Forward packet to actual internet destination
-async fn forward_packet_to_internet(socket: &UdpSocket, payload: &[u8]) -> Result<()> {
-    // This is a simplified version
-    // Real implementation needs to parse IP packet header and extract dest IP/port
-    // For now, just forward to Google DNS as example
-    socket.send_to(payload, "8.8.8.8:53").await?;
-    Ok(())
-}
-
-/// Handle responses from internet back to Android client
-async fn handle_internet_responses(
-    internet_socket: Arc<UdpSocket>,
+/// TUN -> Client handler: Reads from TUN and sends back to clients
+async fn handle_tun_to_client(
+    tun_device: Arc<AsyncDevice>,
     tunnel_socket: Arc<UdpSocket>,
-    session_id: u32,
     sessions: Sessions,
 ) {
     let mut buf = vec![0u8; BUFFER_SIZE];
-    let mut response_seq = 0u32;
+    let mut response_seq_map: HashMap<u32, u32> = HashMap::new();
     
     loop {
-        match internet_socket.recv_from(&mut buf).await {
-            Ok((n, _src)) => {
-                let response = &buf[..n];
+        match tun_device.recv(&mut buf).await {
+            Ok(n) => {
+                if n < 20 {
+                    continue; // Too small for IP packet
+                }
                 
-                // Build response packet with header
-                let mut packet = BytesMut::with_capacity(PACKET_HEADER_SIZE + n);
-                packet.put_u32(session_id);
-                packet.put_u32(response_seq);
-                response_seq = response_seq.wrapping_add(1);
-                packet.put_slice(response);
+                let ip_packet = &buf[..n];
                 
-                // Send to ALL client connections (WiFi + Mobile) for redundancy
+                // Extract destination IP from IP header (bytes 16-19 for IPv4)
+                // Simplified: we need to identify which session this response belongs to
+                // For now, use source IP (bytes 12-15) to match to client's VPN IP
+                
+                let dest_ip = if n >= 20 && (ip_packet[0] >> 4) == 4 {
+                    // IPv4: destination IP is at bytes 16-19
+                    [ip_packet[16], ip_packet[17], ip_packet[18], ip_packet[19]]
+                } else {
+                    continue; // Skip non-IPv4 for now
+                };
+                
+                // Match dest IP 10.0.0.X to session
+                // Client uses 10.0.0.2, so we need to find session by tracking
+                // For simplicity, broadcast to all active sessions (or implement proper routing)
+                
                 let sessions_read = sessions.read().await;
-                if let Some(session) = sessions_read.get(&session_id) {
+                
+                for (session_id, session) in sessions_read.iter() {
+                    // Get or init response sequence for this session
+                    let response_seq = response_seq_map.entry(*session_id).or_insert(0);
+                    
+                    // Build packet with header
+                    let mut packet = BytesMut::with_capacity(PACKET_HEADER_SIZE + n);
+                    packet.put_u32(*session_id);
+                    packet.put_u32(*response_seq);
+                    *response_seq = response_seq.wrapping_add(1);
+                    packet.put_slice(ip_packet);
+                    
+                    // Send to ALL active client connections (WiFi + Mobile)
                     for (client_addr, conn_info) in &session.connections {
-                        // Only send to recently active connections
                         if conn_info.last_seen.elapsed().as_secs() < 10 {
                             if let Err(e) = tunnel_socket.send_to(&packet, client_addr).await {
-                                debug!("Failed to send response to {}: {}", client_addr, e);
+                                debug!("Failed to send to {}: {}", client_addr, e);
                             } else {
-                                debug!("📨 Sent response to {}: {} bytes", client_addr, n);
+                                debug!("📨 Sent {} bytes to {}", n, client_addr);
                             }
                         }
                     }
-                } else {
-                    debug!("Session {} no longer exists", session_id);
-                    break;
                 }
             }
             Err(e) => {
-                debug!("Internet socket recv error: {}", e);
-                break;
+                error!("TUN read error: {}", e);
+                tokio::time::sleep(Duration::from_millis(100)).await;
             }
         }
     }
@@ -339,9 +361,10 @@ async fn cleanup_sessions(sessions: Sessions) {
             info!("📊 Active sessions: {}", active_count);
             for (sid, session) in sessions.iter() {
                 info!(
-                    "  Session {}: {} connections",
+                    "  Session {}: {} connections, {} packets buffered",
                     sid,
-                    session.connections.len()
+                    session.connections.len(),
+                    session.packet_buffer.len()
                 );
             }
         }
