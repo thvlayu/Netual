@@ -154,8 +154,8 @@ sdkmanager --licenses
 # Navigate to android directory
 cd d:\Github\Netual\android
 
-# Build debug APK
-.\gradlew assembleDebug
+# Build debug APK (requires Gradle 8.4+ in PATH)
+gradle assembleDebug
 
 # APK will be at: app\build\outputs\apk\debug\app-debug.apk
 ```
