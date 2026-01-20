@@ -30,6 +30,32 @@ but the android.useAndroidX property is not enabled
 2. ✅ Added `android.enableJetifier=true` for legacy library support
 3. ✅ Created `proguard-rules.pro` for build optimization
 
+---
+
+## Problem 3: Kotlin Compilation Error - Experimental Feature (FIXED)
+The build was failing with:
+```
+e: file:///home/runner/work/Netual/Netual/android/app/src/main/java/com/netual/vpn/NetualVpnService.kt:303:37 
+The feature "break continue in inline lambdas" is experimental and should be enabled explicitly
+```
+
+**Root Cause:** Using `continue` and `break` statements inside inline lambdas (coroutines, synchronized blocks) - an experimental Kotlin feature.
+
+**Solution Applied:**
+1. ✅ Refactored `receiveFromSocket()` method in `NetualVpnService.kt` (line ~303)
+   - Replaced `continue` statement with flag-based approach using `isDuplicate` variable
+   - Code now achieves deduplication logic without experimental features
+
+2. ✅ Fixed `startPacketForwarding()` method (line ~194)
+   - Replaced `break` statement with `return@launch` to exit the coroutine properly
+   
+3. ✅ Updated GitHub Actions workflow to use `--info --warning-mode=all` for better error reporting
+
+**Code Changes:**
+- **Line ~303:** `synchronized` block now returns a boolean flag instead of using `continue`
+- **Line ~194:** Error handling now uses `return@launch` instead of `break`
+- **Line ~143:** Separated Elvis operator from `continue` for clarity (this was safe but improved readability)
+
 ## Changes Made
 - **`.github/workflows/build-android.yml`**: Added `gradle/actions/setup-gradle@v3` step
 - **Removed**: `android/gradlew` and `android/gradlew.bat` (were incomplete)

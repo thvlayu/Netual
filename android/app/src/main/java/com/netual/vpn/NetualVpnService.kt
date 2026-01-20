@@ -140,7 +140,8 @@ class NetualVpnService : VpnService() {
             val networks = connectivityManager.allNetworks
 
             for (network in networks) {
-                val caps = connectivityManager.getNetworkCapabilities(network) ?: continue
+                val caps = connectivityManager.getNetworkCapabilities(network)
+                if (caps == null) continue
                 
                 when {
                     caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) -> {
@@ -190,7 +191,8 @@ class NetualVpnService : VpnService() {
                     if (isRunning) {
                         Log.e(TAG, "Error reading from VPN", e)
                     }
-                    break
+                    // Exit the loop on error
+                    return@launch
                 }
             }
         }
@@ -297,24 +299,29 @@ class NetualVpnService : VpnService() {
                         
                         if (receivedSessionId == sessionId) {
                             // Deduplicate packets (server sends on both paths)
-                            synchronized(seenPackets) {
+                            val isDuplicate = synchronized(seenPackets) {
                                 if (seenPackets.contains(receivedSeq)) {
-                                    Log.d(TAG, "[$name] Duplicate packet $receivedSeq ignored")
-                                    continue
-                                }
-                                seenPackets.add(receivedSeq)
-                                
-                                // Keep set size manageable
-                                if (seenPackets.size > 1000) {
-                                    seenPackets.clear()
+                                    true
+                                } else {
+                                    seenPackets.add(receivedSeq)
+                                    
+                                    // Keep set size manageable
+                                    if (seenPackets.size > 1000) {
+                                        seenPackets.clear()
+                                    }
+                                    false
                                 }
                             }
                             
-                            val payload = ByteArray(length - 8)
-                            buffer.get(payload)
-                            
-                            outputStream.write(payload)
-                            Log.d(TAG, "[$name] Received packet $receivedSeq: ${length - 8} bytes")
+                            if (!isDuplicate) {
+                                val payload = ByteArray(length - 8)
+                                buffer.get(payload)
+                                
+                                outputStream.write(payload)
+                                Log.d(TAG, "[$name] Received packet $receivedSeq: ${length - 8} bytes")
+                            } else {
+                                Log.d(TAG, "[$name] Duplicate packet $receivedSeq ignored")
+                            }
                         }
                     } else if (length == 0) {
                         // Non-blocking read with no data, sleep briefly
